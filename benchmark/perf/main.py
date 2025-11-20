@@ -6,8 +6,8 @@ import time
 from database import QuackDatabase 
 
 TPCH_INPUT_DIR = "."
-SCALE_FACTOR = 5
-DB_PATH = "bench.duckdb"
+SCALE_FACTOR = 10
+DB_PATH = f"bench-sf{SCALE_FACTOR}.duckdb"
 
 THREADS = 16
 MEMORY_MB = 32768
@@ -15,8 +15,6 @@ MEMORY_MB = 32768
 ENABLE_FLAMEGRAPHS = True
 FLAMEGRAPH_DIR = "./FlameGraph"
 PERF_FREQ = 500
-PERF_DATA_DIR = "perf_record"
-FLAMEGRAPH_OUT_DIR = "flamegraphs"
 
 PERF_EVENTS = [
     "cycles,instructions",
@@ -27,23 +25,31 @@ PERF_EVENTS = [
     "context-switches,cpu-migrations",
     "page-faults",
     "dTLB-load-misses,iTLB-load-misses",
+
+    "mem_load_retired.l3_miss,mem_load_retired.local_dram",
 ]
 
 
+PERF_STAT_OUTPUT_DIR = "results/perf"
+PERF_DATA_DIR = "results/perf_record"
+FLAMEGRAPH_OUT_DIR = "results/flamegraphs"
+
 def ensure_dirs():
-    os.makedirs("perf2", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
+    os.makedirs(PERF_STAT_OUTPUT_DIR, exist_ok=True)
     if ENABLE_FLAMEGRAPHS:
         os.makedirs(PERF_DATA_DIR, exist_ok=True)
         os.makedirs(FLAMEGRAPH_OUT_DIR, exist_ok=True)
 
 
 def start_perf_stat(pid: int, q: int, events):
-    output_file = f"perf2/perf_stat_q{q:02d}.txt"
+    output_file = f"{PERF_STAT_OUTPUT_DIR}/perf-sf{SCALE_FACTOR}-q{q:02d}.txt"
 
     perf_cmd = [
         "perf", "stat",
         "-d",
         "-o", output_file,
+        "--json",
         "-p", str(pid),
     ]
 
@@ -57,7 +63,7 @@ def start_perf_stat(pid: int, q: int, events):
 
 
 def start_perf_record(pid: int, q: int):
-    perf_data = os.path.join(PERF_DATA_DIR, f"perf_q{q:02d}.data")
+    perf_data = os.path.join(PERF_DATA_DIR, f"perf-sf{SCALE_FACTOR}-q{q:02d}.data")
 
     cmd = [
         "perf", "record",
@@ -109,20 +115,6 @@ def generate_flamegraph(perf_data_path: str, svg_out_path: str, title: str):
 
     print(f"Generated flamegraph → {svg_out_path}")
 
-def wait_for_perf_ready(perf_pid, timeout=3):
-    """Wait until perf has opened its perf_event file descriptors."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            fds = os.listdir(f"/proc/{perf_pid}/fd")
-        except FileNotFoundError:
-            return False 
-
-        if len(fds) > 3:
-            return True
-        time.sleep(0.01)
-    return False
-
 def main():
     ensure_dirs()
 
@@ -132,10 +124,17 @@ def main():
         memory=MEMORY_MB,
     )
 
-    # db.setup_tpch(
-    #     input_dir_path=TPCH_INPUT_DIR,
-    #     scale_factor=SCALE_FACTOR,
-    # )
+    # see if tpch was setup previously
+    try:
+        db.query("SELECT COUNT(*) FROM customer")
+        print("TPC-H data already exists; skipping setup.")
+    except Exception:
+        print("Setting up TPC-H data...  This may take a while depending on scaling factor.")
+        db.setup_tpch(
+            input_dir_path=TPCH_INPUT_DIR,
+            scale_factor=SCALE_FACTOR,
+        )
+    
 
     pid = os.getpid()
     results = []
@@ -178,13 +177,10 @@ def main():
                     svg_path,
                     title=f"TPC-H Q{q:02d}",
                 )
-
-            break
-
     finally:
         db.close()
 
-    with open("tpch_timings.csv", "w") as f:
+    with open("results/tpch_timings.csv", "w") as f:
         f.write("query;elapsed_ms\n")
         for q, ms in results:
             f.write(f"{q};{ms:.3f}\n")
