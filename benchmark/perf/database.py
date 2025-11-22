@@ -68,7 +68,6 @@ class Database(ABC):
     def tpch(self, query: int):
         return self.query(f"PRAGMA tpch({query});")
 
-
     def disable_object_cache(self):
         self.execute("PRAGMA disable_object_cache;")
 
@@ -77,6 +76,11 @@ class Database(ABC):
         https://duckdb.org/docs/stable/configuration/pragmas#memory-limit
         """
         self.execute(f"PRAGMA memory_limit='{memory_mb}MB';")
+
+    def enable_profiling(self):
+        self.execute("PRAGMA enable_profiling='json';")
+        self.execute("PRAGMA profiling_output='profile.json';")
+        self.execute("PRAGMA profiling_mode='detailed';")
 
 class QuackDatabase(Database):
     """
