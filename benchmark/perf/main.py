@@ -64,19 +64,20 @@ def main():
         total_s = sum(ms for _, ms in results) / 1000.0
         print(f"Total TPC-H time so far: {total_s:.3f} s")
 
-            
-        with open("./profile.json", "r") as f:
-            profile_data = f.read()
+        if args.monitor_default:
+            with open("./profile.json", "r") as f:
+                profile_data = f.read()
 
-        with open(f"results/query_profiling/tpch-sf{SCALE_FACTOR}-q{q}-profile.json", "w") as f:
-            f.write(profile_data)
+            with open(f"results/query_profiling/tpch-sf{SCALE_FACTOR}-q{q}-profile.json", "w") as f:
+                f.write(profile_data)
 
     with open("results/tpch_timings.csv", "w") as f:
         f.write("query;elapsed_ms\n")
         for q, ms in results:
             f.write(f"{q};{ms:.3f}\n")
 
-    os.remove("./profile.json")
+    if os.path.exists("./profile.json"):
+        os.remove("./profile.json")
 
 if __name__ == "__main__":
     main()

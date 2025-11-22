@@ -18,7 +18,7 @@ PERF_EVENTS = [
     "page-faults",
     "dTLB-load-misses,iTLB-load-misses",
 
-    "mem_load_retired.l3_miss,mem_load_retired.local_dram",
+    # "mem_load_retired.l3_miss,mem_load_retired.local_dram",
 ]
 
 # DIRECTORIES
@@ -86,7 +86,7 @@ class PerfMonitor:
     def stop_perf_record(self) -> None:
         self.stop_proc(self.perf_record, "perf record")
 
-    def stop_proc(proc: subprocess.Popen, name: str):
+    def stop_proc(self, proc: subprocess.Popen, name: str):
         if proc is None:
             return
         try:
