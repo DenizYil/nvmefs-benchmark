@@ -35,7 +35,7 @@ class Database(ABC):
                     "allow_unsigned_extensions": "true", 
                     "max_temp_directory_size": "150GB", 
                     "memory_limit": f"{self.memory}MB", 
-                    "threads": self.threads
+                    "threads": self.threads,
                 }
             )
     
@@ -72,9 +72,6 @@ class Database(ABC):
         self.execute("PRAGMA disable_object_cache;")
 
     def set_memory_limit(self, memory_mb: int):
-        """
-        https://duckdb.org/docs/stable/configuration/pragmas#memory-limit
-        """
         self.execute(f"PRAGMA memory_limit='{memory_mb}MB';")
 
     def enable_profiling(self):
@@ -122,18 +119,18 @@ class SPDKDatabase(Database):
 
     def _setup(self):
         print("Setting up SPDKDatabase")
+        extension_path = os.path.abspath(f"/home/group01/nvmefs/build/release/extension/nvmefs/nvmefs.duckdb_extension")
         super()._connect()
-        self.install_extension("../../nvmefs/build/release/extension/nvmefs/nvmefs.duckdb_extension", self)
+        self.install_extension(extension_path)
         self.add_extension("nvmefs")
         self.execute(f"""CREATE OR REPLACE PERSISTENT SECRET nvmefs (
                         TYPE NVMEFS,
                         nvme_device_path '{self.device_path}',
-                        fdp_plhdls       '{self.number_of_fdp_handles}',
                         backend          '{self.backend}'
                     );""")
-        
         self.execute(f"ATTACH DATABASE '{self.db_path}' AS bench (READ_WRITE);")
         self.execute("USE bench;")
+        self.disable_object_cache()
         
 
 class NvmeDatabase(Database):
@@ -149,16 +146,17 @@ class NvmeDatabase(Database):
         self.number_of_fdp_handles = 7
     
     def _setup(self):
-        self.install_extension("../../nvmefs/build/release/extension/nvmefs/nvmefs.duckdb_extension", self)
+        extension_path = os.path.abspath(f"/home/group01/nvmefs/build/release/extension/nvmefs/nvmefs.duckdb_extension")
         super()._connect()
+        self.install_extension(extension_path)
         self.add_extension("nvmefs")
         self.execute(f"""CREATE OR REPLACE PERSISTENT SECRET nvmefs (
                         TYPE NVMEFS,
                         nvme_device_path '{self.device_path}',
-                        fdp_plhdls       '{self.number_of_fdp_handles}',
                         backend          '{self.backend}'
                     );""")
         
         self.execute(f"ATTACH DATABASE '{self.db_path}' AS bench (READ_WRITE);")
         self.execute("USE bench;")
+        self.disable_object_cache()
 
