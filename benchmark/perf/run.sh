@@ -64,9 +64,9 @@ setup_environment() {
 
 # ================= Main =================
 
-scale_factors=(5) #1 10 100
-threads_list=(16) #1 2 4 8 16
-memory_limit=512
+scale_factors=(1 10 100) 
+threads_list=(1 2 4 8 16) 
+memory_limit=2000
 backend_targets=("posix" "io_uring")
 
 echo "Starting Experiment Suite..."
