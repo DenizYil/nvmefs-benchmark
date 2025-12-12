@@ -2,9 +2,8 @@
 
 # ================= Configuration =================
 
-THREADS=16
-MEMORY_MB=2000
 DEFAULT_DEVICE="/dev/nvme0n1"
+export NVME_DEVICE_PATH="$DEFAULT_DEVICE"
 
 # Paths
 SECRET_FILE="$HOME/.duckdb/stored_secrets/nvmefs.duckdb_secret"
@@ -65,10 +64,13 @@ setup_environment() {
 
 # ================= Main =================
 
-scale_factors=(1)
+scale_factors=(1 10 100)
+threads_list=(1 2 4 8 16)
 backend_targets=("posix" "io_uring")
 
 echo "Starting Experiment Suite..."
+
+
 
 for target in "${backend_targets[@]}"
 do
@@ -76,19 +78,38 @@ do
     do
         setup_environment "$target"
 
-        for i in {1..2}
+        echo "--- STARTING SEEDING PHASE for Target=$target SF=$sf ---"
+
+        # 2. RUN ONCE to setup secrets (Data Seeding)
+        python3 -u main.py \
+            --sf="$sf" \
+            --target="$target" \
+            --threads="1" \
+            --folder="results-${target}-sf${sf}-SETUP" \
+            --monitor-perf
+
+        echo "--- SEEDING COMPLETE. STARTING BENCHMARKS ---"
+
+        for t in "${threads_list[@]}"
         do
-            echo "Running benchmark with target=$target, scale factor=$sf"
+            OUTPUT_FOLDER="results-${target}-sf${sf}-t${t}"
+
+            echo "Running: Target=$target | SF=$sf | Threads=$t"    
 
             if command -v python3 &> /dev/null; then
-                echo "Executing: python3 main.py --sf=$sf --target=$target --folder=results-${target}-sf${sf}-${i} --monitor-perf"
-                python3 -u main.py --sf="$sf" --target="$target" --folder="results-${target}-sf${sf}-${i}" --monitor-perf
+                echo "Executing: python3 main.py --sf=$sf --target=$target --threads="$t" --folder=results-${OUTPUT_FOLDER}-sf${sf} --monitor-perf"
+                python3 -u main.py \
+                    --sf="$sf" \
+                    --target="$target" \
+                    --threads="$t" \
+                    --folder="$OUTPUT_FOLDER" \
+                    --monitor-perf
             else
                 echo "Error: python3 not found."
                 exit 1
             fi
 
-            echo "Finished run with sf=$sf"
+            echo "Finished run with sf=$sf threads=$t"
             echo "-----------------------------------"
         done
     done
