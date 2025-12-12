@@ -2,7 +2,7 @@ import os
 import subprocess
 import signal
 import time
-import re
+import statistics
 from contextlib import contextmanager
 
 ENABLE_LOCK_PROFILING = True
@@ -96,6 +96,7 @@ class PerfMonitor:
          "-p", str(pid),
          "-o", output_file,
          "-e", "syscalls:sys_enter_futex",
+         "-e", "syscalls:sys_exit_futex",
          "--call-graph", "dwarf,8192",
          "-m", "16M",
          "-F", str(PERF_FREQ),
@@ -150,14 +151,6 @@ class PerfMonitor:
           print(f"Perf data captured: {size/1024:.2f} KB")
    
    def generate_lock_report(self, q: int):
-      """
-      1. dumps raw stack traces using 'perf script'
-      2. filters for TemporaryFileMetadataManager functions
-      3. counts contention events per function
-      4. writes a clean report
-      5. DELETES the raw binary file to save space
-      """
-      # 1. Setup Paths
       data_filename = f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.data"
       input_file = os.path.join(self.perf_data_dir, data_filename)
 
@@ -167,120 +160,117 @@ class PerfMonitor:
 
       report_filename = f"perf-lock-report-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
       output_txt = os.path.join(self.perf_lock_dir, report_filename)
-
-      print(f"Generating clean lock report for Q{q:02d}...")
-
-      # 2. Run 'perf script' to stream raw text data
-      #    We use a PIPE to process line-by-line in memory (no massive intermediate text file)
-      cmd = ["perf", "script", "-i", input_file, "--demangle"]
       
-      from collections import Counter
-      func_counts = Counter()
+      print(f"Generating latency report (ms) for Q{q:02d}...")
+
+      # -F fields: comm, pid, tid, time, event, ip, sym
+      cmd = ["perf", "script", "-i", input_file, "--demangle", "-F", "comm,pid,tid,time,event,ip,sym"]
       
-      # The class we want to focus on
       TARGET_CLASS = "TemporaryFileMetadataManager"
+      
+      inflight_waits = {} # { tid: start_timestamp_seconds }
+      thread_blame = {}   # { tid: "FunctionName" }
+      results = {}        # { func_name: [duration_ms, duration_ms, ...] }
 
       try:
-          # bufsize=1 enables line buffering
+          # bufsize=1 enables line buffering for memory efficiency
           process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
           
-          current_event_handled = False
-
-          # 3. Parse output line by line
+          current_tid = None
+          current_event = None
+          current_timestamp = 0.0
+          
           for line in process.stdout:
-              # Lines starting with non-whitespace are Events (headers)
-              # Lines starting with whitespace are Stack Frames
-              if line and line[0].isalnum(): 
-                  current_event_handled = False # New event started, reset flag
-                  continue
-              
-              # If we haven't found the culprit for this event yet...
-              if not current_event_handled:
-                  # Check if this stack frame belongs to our Manager
-                  if TARGET_CLASS in line:
-                      # EXTRACT CLEAN FUNCTION NAME
-                      # Example Line: "    7f... duckdb::TemporaryFileMetadataManager::GetLBA(std::string...)+0x1a ..."
+              line = line.strip()
+              if not line: continue
+
+              # 1. HEADER LINE DETECTION (Contains timestamp and event type)
+              if "syscalls:" in line:
+                  parts = line.split()
+                  try:
+                      # Find timestamp (looks like 12345.6789:)
+                      time_str = next(s for s in parts if ":" in s and "." in s).strip(":")
+                      current_timestamp = float(time_str)
                       
-                      # 1. Find start of the class name
-                      start_idx = line.find(TARGET_CLASS)
+                      # Find TID (looks like 1234/5678 or just 5678)
+                      tid_part = next(s for s in parts if s.replace('/','').isdigit())
+                      current_tid = tid_part.split('/')[-1]
                       
-                      # 2. Find end (usually at '(' for args or '+' for offset or end of line)
-                      end_idx = line.find("(", start_idx)
-                      if end_idx == -1: end_idx = line.find("+", start_idx)
-                      if end_idx == -1: end_idx = len(line)
-                      
-                      # 3. Extract and Clean
-                      func_name = line[start_idx:end_idx].strip()
-                      
-                      # Count it!
-                      func_counts[func_name] += 1
-                      
-                      # Stop looking at this stack (we want the deepest call in the manager)
-                      current_event_handled = True
+                      if "sys_enter_futex" in line:
+                          current_event = "ENTER"
+                          inflight_waits[current_tid] = current_timestamp
+                          
+                      elif "sys_exit_futex" in line:
+                          current_event = "EXIT"
+                          # Calculate Duration if we were tracking this thread
+                          if current_tid in inflight_waits and current_tid in thread_blame:
+                              start_time = inflight_waits.pop(current_tid)
+                              func_name = thread_blame.pop(current_tid)
+                              
+                              # CONVERSION: Seconds -> Milliseconds
+                              duration_ms = (current_timestamp - start_time) * 1_000.0
+                              
+                              if func_name not in results: results[func_name] = []
+                              results[func_name].append(duration_ms)
+                          
+                          # Clean up if it wasn't our target class
+                          if current_tid in inflight_waits: del inflight_waits[current_tid]
+                          
+                  except StopIteration:
+                      continue
+
+              # 2. STACK LINE DETECTION (Contains function names)
+              elif current_event == "ENTER" and TARGET_CLASS in line:
+                  # We found the function causing the wait!
+                  
+                  # Extract just the function name (e.g., "TemporaryFileMetadataManager::GetLBA")
+                  start_idx = line.find(TARGET_CLASS)
+                  end_idx = line.find("(", start_idx)
+                  if end_idx == -1: end_idx = len(line)
+                  
+                  func_name = line[start_idx:end_idx].strip()
+                  
+                  # Blame this function for the current wait on this thread
+                  thread_blame[current_tid] = func_name
+                  
+                  # Stop parsing stack for this event
+                  current_event = None 
 
           process.wait()
-          if process.returncode != 0:
-              print(f"[WARNING] perf script exited with error: {process.stderr.read()}")
 
       except Exception as e:
-          print(f"[ERROR] Failed to parse perf data: {e}")
+          print(f"[ERROR] Parsing failed: {e}")
           return
 
-      # 4. Write the Clean Report
+      # 3. WRITE REPORT
       with open(output_txt, "w") as f:
-          f.write(f"Lock Contention Report: {TARGET_CLASS}\n")
+          f.write(f"Lock Latency Report: {TARGET_CLASS}\n")
           f.write(f"Query: Q{q:02d}\n")
-          f.write("=" * 60 + "\n")
-          f.write(f"{'Count':<8} | {'Function'}\n")
-          f.write("-" * 60 + "\n")
+          f.write("=" * 110 + "\n")
+          # Header adjusted for ms
+          header = f"{'Function':<55} | {'Count':<6} | {'Avg (ms)':<10} | {'Min (ms)':<10} | {'Max (ms)':<10}"
+          f.write(header + "\n")
+          f.write("-" * 110 + "\n")
           
-          if not func_counts:
-              f.write("No lock contention detected for this class.\n")
+          if not results:
+              f.write("No contention detected for this class.\n")
           else:
-              for func, count in func_counts.most_common():
-                  f.write(f"{count:<8} | {func}\n")
-      
+              for func, durations in results.items():
+                  count = len(durations)
+                  avg_wait = statistics.mean(durations)
+                  min_wait = min(durations)
+                  max_wait = max(durations)
+                  
+                  # Formatted to 3 decimal places (e.g., 0.125 ms)
+                  f.write(f"{func:<55} | {count:<6} | {avg_wait:<10.3f} | {min_wait:<10.3f} | {max_wait:<10.3f}\n")
+
       print(f"Report saved to: {output_txt}")
-
-      # 5. AUTO-CLEANUP: Delete the massive binary file
-      try:
+      
+      # 4. CLEANUP
+      if os.path.exists(input_file):
           os.remove(input_file)
-          print(f"[CLEANUP] Deleted raw data file: {input_file}")
-      except OSError as e:
-          print(f"[WARNING] Failed to delete data file: {e}")
+          print(f"[CLEANUP] Deleted raw data file.")
 
-   # def generate_lock_report(self, q: int):
-   #    """Converts the binary perf data into a readable text report."""
-   #    filename = f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.data"
-
-   #    input_file = os.path.join(self.perf_data_dir, filename)
-
-   #    if not os.path.exists(input_file):
-   #          print(f"[ERROR] Data file missing: {input_file}")
-   #          return
-
-   #    output_filename = f"perf-lock-report-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
-   #    output_txt = os.path.join(self.perf_lock_dir, output_filename)
-
-   #    print(f"Generating lock report for Q{q:02d}...")
-   #    print(f"Reading: {input_file}")
-   #    print(f"Writing: {output_txt}")
-
-   #    with open(output_txt, "w") as f:
-   #       # EXPLANATION OF FLAGS:
-   #       # --stdio : Print to text file
-   #       # --demangle : Convert weird C++ symbols to human names
-   #       # -n : Show the exact count of samples (how many times it waited)
-   #       # -g graph,0.0,caller : 
-   #       #     graph  = Use a tree view
-   #       #     0.0    = Show EVERYTHING (don't hide small events)
-   #       #     caller = Invert the tree. Show the lock first, then indent the function that called it.
-   #       subprocess.run(
-   #          ["perf", "report", "-i", input_file, "--stdio", "-n", "--demangle", "-g", "graph,0.0,caller"], 
-   #          stdout=f, 
-   #          stderr=subprocess.STDOUT
-   #       )
-   #    print(f"Report saved.")
    
  
    # ---------------------------------------------------------
