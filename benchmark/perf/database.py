@@ -117,6 +117,8 @@ class SPDKDatabase(Database):
         self.use_fdp = config.use_fdp
         self.backend = config.backend
 
+        super().__init__(db_path, threads, memory)
+
     def _setup(self):
         print("Setting up SPDKDatabase")
         extension_path = os.path.abspath(f"/home/group01/nvmefs/build/release/extension/nvmefs/nvmefs.duckdb_extension")
@@ -139,11 +141,11 @@ class NvmeDatabase(Database):
     """
 
     def __init__(self, db_path: str, threads: int, memory: int, config: ConnectionConfig):
-        super().__init__(db_path, threads, memory)
         self.device_path = config.device
         self.backend = config.backend
         self.use_fdp = config.use_fdp
         self.number_of_fdp_handles = 7
+        super().__init__(db_path, threads, memory)
     
     def _setup(self):
         extension_path = os.path.abspath(f"/home/group01/nvmefs/build/release/extension/nvmefs/nvmefs.duckdb_extension")

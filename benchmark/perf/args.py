@@ -26,10 +26,17 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--threads",
+        type=int,
+        help="Number of threads to use for benchmarking",
+        required=True,
+    )
+
+    parser.add_argument(
         "--sf",
         type=int,
+        default=16,
         help="TPC-H Scale Factor",
-        required=True,
     )
 
     parser.add_argument(

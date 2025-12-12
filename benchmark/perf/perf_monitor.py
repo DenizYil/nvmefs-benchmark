@@ -2,234 +2,327 @@ import os
 import subprocess
 import signal
 import time
+import re
 from contextlib import contextmanager
 
-ENABLE_FLAMEGRAPHS = True
 ENABLE_LOCK_PROFILING = True
-FLAMEGRAPH_DIR = "./FlameGraph"
 PERF_FREQ = 500
+STRICT_PERF_FREQ = 49
 
 PERF_EVENTS = [
-    "cycles,instructions",
-    "cache-references,cache-misses",
-    "L1-dcache-loads,L1-dcache-load-misses",
-    "LLC-loads,LLC-load-misses",
-    "branch-instructions,branch-misses",
-    "context-switches,cpu-migrations",
-    "page-faults",
-    "dTLB-load-misses,iTLB-load-misses",
+   "cycles,instructions",
+   "cache-references,cache-misses",
+   "L1-dcache-loads,L1-dcache-load-misses",
+   "LLC-loads,LLC-load-misses",
+   "branch-instructions,branch-misses",
+   "context-switches,cpu-migrations",
+   "page-faults",
+   "dTLB-load-misses,iTLB-load-misses",
 ]
 
 SSD_EVENTS = [
-    "block:block_rq_issue",
-    "block:block_rq_complete",
-    "nvme:nvme_async_event",
-    "nvme:nvme_setup_cmd",
-    "nvme:nvme_complete_rq",
-    "nvme:nvme_sq",
+   "block:block_rq_issue",
+   "block:block_rq_complete",
+   "nvme:nvme_async_event",
+   "nvme:nvme_setup_cmd",
+   "nvme:nvme_complete_rq",
+   "nvme:nvme_sq",
 ]
 
-# DIRECTORIES
-PERF_STAT_OUTPUT_DIR = "/perf"
-PERF_DATA_DIR = "/perf_record"
-FLAMEGRAPH_OUT_DIR = "/flamegraphs"
-PERF_LOCK_DIR = "/perf_lock"
-
 class PerfMonitor:
-    def __init__(self, scale_factor: int, target: str, folder: str):
-        self.scale_factor = scale_factor
-        self.target = target
-        self.folder = folder
+   def __init__(self, scale_factor: int, target: str, folder: str):
+      self.scale_factor = scale_factor
+      self.target = target
+      self.folder = os.path.abspath(folder)
 
-        global PERF_STAT_OUTPUT_DIR, PERF_DATA_DIR, FLAMEGRAPH_OUT_DIR, PERF_LOCK_DIR
+      self.perf_stat_dir = os.path.join(self.folder, "perf")
+      self.perf_data_dir = os.path.join(self.folder, "perf_record")
+      self.perf_lock_dir = os.path.join(self.folder, "perf_lock")
 
-        PERF_STAT_OUTPUT_DIR = self.folder + PERF_STAT_OUTPUT_DIR
-        PERF_DATA_DIR = self.folder + PERF_DATA_DIR
-        FLAMEGRAPH_OUT_DIR = self.folder + FLAMEGRAPH_OUT_DIR
-        PERF_LOCK_DIR = self.folder + PERF_LOCK_DIR
+      self.perf_stat = None
+      self.perf_record = None
+      self.perf_record_data_path = None
+   
+      self.ensure_dirs()
 
-        self.perf_stat = None
-        self.perf_record = None
-        self.perf_record_data_path = None
-        self.perf_lock_data_path = None
+   def ensure_dirs(self):
+      os.makedirs(self.folder, exist_ok=True)
+      os.makedirs(self.perf_stat_dir, exist_ok=True)
+      os.makedirs(self.perf_data_dir, exist_ok=True)
+      if ENABLE_LOCK_PROFILING:
+         os.makedirs(self.perf_lock_dir, exist_ok=True)
+      
+   # ---------------------------------------------------------
+   # 1. PERF STAT (CPU & SSD Counters)
+   # ---------------------------------------------------------
 
-        self.ensure_dirs()
+   def start_perf_stat(self, pid: int, q: int) -> None:
+      output_file = f"{self.perf_stat_dir}/perf-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
+      
+      perf_cmd = [
+         "perf", "stat",
+         "-d",
+         "-o", output_file,
+         "--json",
+         "-p", str(pid),
+      ]
 
-    def ensure_dirs(self):
-        os.makedirs(self.folder, exist_ok=True)
-        os.makedirs(PERF_STAT_OUTPUT_DIR, exist_ok=True)
-        if ENABLE_FLAMEGRAPHS:
-            os.makedirs(PERF_DATA_DIR, exist_ok=True)
-            os.makedirs(FLAMEGRAPH_OUT_DIR, exist_ok=True)
-        if ENABLE_LOCK_PROFILING:
-            os.makedirs(PERF_LOCK_DIR, exist_ok=True)
+      for ev in PERF_EVENTS:
+         perf_cmd += ["-e", ev + ":u"]
+      
+      for ev in SSD_EVENTS: 
+         perf_cmd += ["-e", ev]
 
-    def start_perf_stat(self, pid: int, q: int) -> None:
-        output_file = f"{PERF_STAT_OUTPUT_DIR}/perf-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
-        
-        perf_cmd = [
-            "perf", "stat",
-            "-d",
-            "-o", output_file,
-            "--json",
-            "-p", str(pid),
-        ]
+      self.perf_stat = subprocess.Popen(perf_cmd)
+      print(f"Started perf stat for Q{q:02d}: PID={self.perf_stat.pid}")
+   
+   def stop_perf_stat(self) -> None:
+      self.stop_proc(self.perf_stat, "perf stat")
+   
+   # ---------------------------------------------------------
+   # 2. PERF RECORD 
+   # ---------------------------------------------------------
 
-        for ev in PERF_EVENTS:
-            perf_cmd += ["-e", ev + ":u"]
-        
-        for ev in SSD_EVENTS: 
-            perf_cmd += ["-e", ev]
+   def start_perf_record(self, pid: int, q: int) -> None:
+      if not ENABLE_LOCK_PROFILING:
+         return
+      filename = f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.data"
+      output_file = os.path.join(self.perf_data_dir, filename)
 
-        self.perf_stat = subprocess.Popen(perf_cmd)
-        print(f"Started perf stat for Q{q:02d}: PID={self.perf_stat.pid}")
+      self.perf_record_data_path = output_file
 
-    def start_perf_record(self, pid: int, q: int) -> None:
-        self.perf_record_data_path = os.path.join(PERF_DATA_DIR, f"perf-{self.target}-sf{self.scale_factor}-q{q:02d}.data")
+      perf_cmd = [
+         "perf", "record",
+         "-p", str(pid),
+         "-o", output_file,
+         "-e", "syscalls:sys_enter_futex",
+         "--call-graph", "dwarf,8192",
+         "-m", "16M",
+         "-F", str(PERF_FREQ),
+      ]
 
-        cmd = [
-            "perf", "record",
-            "-F", str(PERF_FREQ),
-            "--call-graph", "dwarf",
+      self.perf_record = subprocess.Popen(perf_cmd, stderr=subprocess.PIPE)
+      
+      time.sleep(1.0)
+      if self.perf_record.poll() is not None:
+          # It crashed immediately
+          err = self.perf_record.stderr.read().decode()
+          print(f"\n[CRITICAL ERROR] perf record failed to start for Q{q:02d}!")
+          print(f"Command: {' '.join(perf_cmd)}")
+          print(f"Error: {err}\n")
+          self.perf_record = None
+          return
 
-            # CPU sampling
-            "-e", "cycles",
+      print(f"Started perf record (Lock Profiling) for Q{q:02d}: PID={self.perf_record.pid}")
+   
+   def stop_perf_record(self) -> None:
+      if not self.perf_record:
+         return
 
-            # Block layer events (all storage devices, including NVMe)
-            "-e", "block:block_rq_issue",
-            "-e", "block:block_rq_complete",
+      print(f"Stopping perf record (PID={self.perf_record.pid})...")
+      
+      # 1. Polite Stop
+      self.perf_record.send_signal(signal.SIGINT)
+      
+      stdout_data, stderr_data = None, None
+      
+      # 2. Wait for flush
+      try:
+          stdout_data, stderr_data = self.perf_record.communicate(timeout=5)
+      except subprocess.TimeoutExpired:
+          print("[WARNING] Perf hung during flush, forcing kill...")
+          self.perf_record.kill()
+          stdout_data, stderr_data = self.perf_record.communicate()
+      
+      print("perf record stopped.")
 
-            # NVMe-specific tracepoints (from your `perf list nvme`)
-            "-e", "nvme:nvme_setup_cmd",
-            "-e", "nvme:nvme_complete_rq",
+      # 3. Print Errors (Now this will actually work because we piped stderr above)
+      if stderr_data:
+          err_msg = stderr_data.decode('utf-8', errors='ignore')
+          if "Error" in err_msg or "failed" in err_msg or "denied" in err_msg:
+              print(f"----------------------------------------")
+              print(f"[PERF ERROR DETAILS]:\n{err_msg}")
+              print(f"----------------------------------------")
 
-            "-o", self.perf_record_data_path,
-            "-p", str(pid),
-        ]
+      # 4. Generate Report logic...
+      if self.perf_record_data_path and os.path.exists(self.perf_record_data_path):
+          size = os.path.getsize(self.perf_record_data_path)
+          print(f"Perf data captured: {size/1024:.2f} KB")
+   
+   def generate_lock_report(self, q: int):
+      """
+      1. dumps raw stack traces using 'perf script'
+      2. filters for TemporaryFileMetadataManager functions
+      3. counts contention events per function
+      4. writes a clean report
+      5. DELETES the raw binary file to save space
+      """
+      # 1. Setup Paths
+      data_filename = f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.data"
+      input_file = os.path.join(self.perf_data_dir, data_filename)
 
-        self.perf_record = subprocess.Popen(cmd)
-
-        # must sleep 1 second, otherwise perf record doesn't start and queries finish first
-        # maybe we can figure out a better way, but this works for now.
-        time.sleep(1.0)
-        print(f"Started perf record for Q{q:02d}: PID={self.perf_record.pid}, data={self.perf_record_data_path}")
-
-    def start_perf_lock(self, pid: int, q: int) -> None:
-        self.perf_lock_data_path = os.path.join(
-            PERF_LOCK_DIR, 
-            f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.data")
-
-        cmd = [
-           "perf", "lock", "record",
-            "-o", self.perf_lock_data_path,
-            "-p", str(pid),
-        ]
-
-        self.perf_lock = subprocess.Popen(cmd)
-
-        time.sleep(1.0)
-        print(f"Started perf lock for Q{q:02d}: PID={self.perf_lock.pid}, data={self.perf_lock_data_path}")
-
-    def stop_perf_stat(self) -> None:
-        self.stop_proc(self.perf_stat, "perf stat")
-
-    def stop_perf_record(self) -> None:
-        self.stop_proc(self.perf_record, "perf record")
-
-    def stop_perf_lock(self) -> None:
-        self.stop_proc(self.perf_lock, "perf lock")
-    
-    def generate_lock_report(self, q: int):
-        if not self.perf_lock_data_path:
+      if not os.path.exists(input_file):
+            print(f"[ERROR] Data file missing: {input_file}")
             return
-        
-        report_path = os.path.join(
-            PERF_LOCK_DIR,
-            f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
-        )
 
-        with open(report_path, "wb") as f:
-            subprocess.run(
-                ["perf", "lock", "report", "-i", self.perf_lock_data_path],
-                stdout=f,
-                stderr=subprocess.STDOUT
-            )
-        print(f"Generated perf lock report at {report_path}")
+      report_filename = f"perf-lock-report-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
+      output_txt = os.path.join(self.perf_lock_dir, report_filename)
 
-    def generate_lock_contention(self, q: int): # Runs perf lock con
-        if not self.perf_lock_data_path:
-            return
-        
-        contention_path = os.path.join(
-            PERF_LOCK_DIR,
-            f"perf-lock-con-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
-        )
+      print(f"Generating clean lock report for Q{q:02d}...")
 
-        with open(contention_path, "wb") as f:
-            subprocess.run(
-                ["perf", "lock", "contention", "-ab", self.perf_lock_data_path],
-                stdout=f,
-                stderr=subprocess.STDOUT
-            )
-        print(f"Generated perf lock contention report at {contention_path}")
+      # 2. Run 'perf script' to stream raw text data
+      #    We use a PIPE to process line-by-line in memory (no massive intermediate text file)
+      cmd = ["perf", "script", "-i", input_file, "--demangle"]
+      
+      from collections import Counter
+      func_counts = Counter()
+      
+      # The class we want to focus on
+      TARGET_CLASS = "TemporaryFileMetadataManager"
 
-    def stop_proc(self, proc: subprocess.Popen, name: str):
-        if proc is None:
-            return
-        try:
-            proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            # It might already be gone; ignore.
-            return
-        
-        proc.wait()
-        print(f"{name} stopped (pid={proc.pid})")
-                
-    @contextmanager
-    def profile(self, pid: int, q: int):
-        try:
-            if ENABLE_FLAMEGRAPHS:
-                self.start_perf_record(pid, q)
-            if ENABLE_LOCK_PROFILING:
-                self.start_perf_lock(pid, q)
+      try:
+          # bufsize=1 enables line buffering
+          process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+          
+          current_event_handled = False
 
-            self.start_perf_stat(pid, q)
-            yield
-        finally:
-            self.stop_perf_stat()
-            if ENABLE_FLAMEGRAPHS:
-                self.stop_perf_record()
-                self.generate_flamegraph(q)
-            if ENABLE_LOCK_PROFILING:
-                self.stop_perf_lock()
-                self.generate_lock_report(q)
-                self.generate_lock_contention(q)
+          # 3. Parse output line by line
+          for line in process.stdout:
+              # Lines starting with non-whitespace are Events (headers)
+              # Lines starting with whitespace are Stack Frames
+              if line and line[0].isalnum(): 
+                  current_event_handled = False # New event started, reset flag
+                  continue
+              
+              # If we haven't found the culprit for this event yet...
+              if not current_event_handled:
+                  # Check if this stack frame belongs to our Manager
+                  if TARGET_CLASS in line:
+                      # EXTRACT CLEAN FUNCTION NAME
+                      # Example Line: "    7f... duckdb::TemporaryFileMetadataManager::GetLBA(std::string...)+0x1a ..."
+                      
+                      # 1. Find start of the class name
+                      start_idx = line.find(TARGET_CLASS)
+                      
+                      # 2. Find end (usually at '(' for args or '+' for offset or end of line)
+                      end_idx = line.find("(", start_idx)
+                      if end_idx == -1: end_idx = line.find("+", start_idx)
+                      if end_idx == -1: end_idx = len(line)
+                      
+                      # 3. Extract and Clean
+                      func_name = line[start_idx:end_idx].strip()
+                      
+                      # Count it!
+                      func_counts[func_name] += 1
+                      
+                      # Stop looking at this stack (we want the deepest call in the manager)
+                      current_event_handled = True
+
+          process.wait()
+          if process.returncode != 0:
+              print(f"[WARNING] perf script exited with error: {process.stderr.read()}")
+
+      except Exception as e:
+          print(f"[ERROR] Failed to parse perf data: {e}")
+          return
+
+      # 4. Write the Clean Report
+      with open(output_txt, "w") as f:
+          f.write(f"Lock Contention Report: {TARGET_CLASS}\n")
+          f.write(f"Query: Q{q:02d}\n")
+          f.write("=" * 60 + "\n")
+          f.write(f"{'Count':<8} | {'Function'}\n")
+          f.write("-" * 60 + "\n")
+          
+          if not func_counts:
+              f.write("No lock contention detected for this class.\n")
+          else:
+              for func, count in func_counts.most_common():
+                  f.write(f"{count:<8} | {func}\n")
+      
+      print(f"Report saved to: {output_txt}")
+
+      # 5. AUTO-CLEANUP: Delete the massive binary file
+      try:
+          os.remove(input_file)
+          print(f"[CLEANUP] Deleted raw data file: {input_file}")
+      except OSError as e:
+          print(f"[WARNING] Failed to delete data file: {e}")
+
+   # def generate_lock_report(self, q: int):
+   #    """Converts the binary perf data into a readable text report."""
+   #    filename = f"perf-lock-{self.target}-sf{self.scale_factor}-q{q:02d}.data"
+
+   #    input_file = os.path.join(self.perf_data_dir, filename)
+
+   #    if not os.path.exists(input_file):
+   #          print(f"[ERROR] Data file missing: {input_file}")
+   #          return
+
+   #    output_filename = f"perf-lock-report-{self.target}-sf{self.scale_factor}-q{q:02d}.txt"
+   #    output_txt = os.path.join(self.perf_lock_dir, output_filename)
+
+   #    print(f"Generating lock report for Q{q:02d}...")
+   #    print(f"Reading: {input_file}")
+   #    print(f"Writing: {output_txt}")
+
+   #    with open(output_txt, "w") as f:
+   #       # EXPLANATION OF FLAGS:
+   #       # --stdio : Print to text file
+   #       # --demangle : Convert weird C++ symbols to human names
+   #       # -n : Show the exact count of samples (how many times it waited)
+   #       # -g graph,0.0,caller : 
+   #       #     graph  = Use a tree view
+   #       #     0.0    = Show EVERYTHING (don't hide small events)
+   #       #     caller = Invert the tree. Show the lock first, then indent the function that called it.
+   #       subprocess.run(
+   #          ["perf", "report", "-i", input_file, "--stdio", "-n", "--demangle", "-g", "graph,0.0,caller"], 
+   #          stdout=f, 
+   #          stderr=subprocess.STDOUT
+   #       )
+   #    print(f"Report saved.")
+   
+ 
+   # ---------------------------------------------------------
+   # UTILS & CONTEXT MANAGER
+   # ---------------------------------------------------------
+
+   def stop_proc(self, proc: subprocess.Popen, name: str):
+      if proc is None:
+         return
+      
+      print(f"[PerfMonitor] Stopping {name} (pid={proc.pid})...")
+      try:
+         # SIGINT (Ctrl+C) usually best for perf to flush buffers
+         proc.send_signal(signal.SIGINT)
+         proc.wait(timeout=10)
+      except subprocess.TimeoutExpired:
+         print(f"[PerfMonitor] {name} hung, forcing kill...")
+         proc.kill()
+         proc.wait()
+      except ProcessLookupError:
+         pass # Process already died
+         
+      print(f"[PerfMonitor] {name} stopped.")
+
+   @contextmanager
+   def profile(self, pid: int, q: int):
+      try:
+         self.start_perf_record(pid, q)
+         self.start_perf_stat(pid, q)
+         yield
+      finally:
+         self.stop_perf_stat()
+         self.stop_perf_record()
+
+         if ENABLE_LOCK_PROFILING:
+            self.generate_lock_report(q) 
+         
+         # # --- CRITICAL SAFETY FEATURE ---
+         # # Delete the massive raw data file immediately
+         # if self.perf_record_data_path and os.path.exists(self.perf_record_data_path):
+         #    print(f"[PerfMonitor] Cleaning up raw data: {self.perf_record_data_path}")
+         #    os.remove(self.perf_record_data_path)
 
 
-    def generate_flamegraph(self, q: int):
-        stackcollapse = os.path.join(FLAMEGRAPH_DIR, "stackcollapse-perf.pl")
-        flamegraph = os.path.join(FLAMEGRAPH_DIR, "flamegraph.pl")
-        svg_path = os.path.join(FLAMEGRAPH_OUT_DIR, f"flame-{self.target}-{self.scale_factor}-q{q:02d}.svg")
-        title = f"TPC-H Q{q:02d}"
 
-        p1 = subprocess.Popen(
-            ["perf", "script", "-i", self.perf_record_data_path],
-            stdout=subprocess.PIPE,
-        )
-
-        p2 = subprocess.Popen(
-            [stackcollapse],
-            stdin=p1.stdout,
-            stdout=subprocess.PIPE,
-        )
-
-        with open(svg_path, "wb") as svg_file:
-            p3 = subprocess.Popen(
-                [flamegraph, "--title", title],
-                stdin=p2.stdout,
-                stdout=svg_file,
-            )
-
-            p3.wait()
-
-        print(f"Generated flamegraph → {svg_path}")
