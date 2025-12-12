@@ -2,10 +2,15 @@ import os
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import json
 
 # --- 1. CONFIGURATION ---
 BASE_DIR = '.'  
-OUTPUT_FOLDER = 'plots'
+
+# Define output subfolders
+METRICS_DIR = os.path.join('plots', 'metrics')
+PERF_DIR = os.path.join('plots', 'perf')
+
 BACKENDS = ['posix', 'io_uring']
 SCALING_FACTORS = [1, 10, 100]
 THREADS = [2, 4, 8, 16]
@@ -14,19 +19,20 @@ TARGET_QUERIES = [6, 9, 13, 18]
 # --- 2. ACADEMIC STYLE ---
 plt.rcParams.update({
     "font.family": "serif",
-    # We add 'DejaVu Serif' (built-in) and 'serif' (system default) to prevent crashes
     "font.serif": ["Times New Roman", "Times", "DejaVu Serif", "serif"],
     "font.size": 11,
     "axes.labelsize": 12,
     "legend.fontsize": 11,
-    "svg.fonttype": "none",  # Text stays as text (good for Overleaf)
+    "svg.fonttype": "none",
     "figure.autolayout": False
 })
 
+# --- 3. DATA LOADING ---
+
 def load_csv_data():
-    """Loads all CSVs into a single DataFrame."""
+    """Loads throughput/latency CSVs."""
     all_data = []
-    print(f"Scanning directory: {os.path.abspath(BASE_DIR)}")
+    print(f"Scanning CSVs in: {os.path.abspath(BASE_DIR)}")
 
     for backend in BACKENDS:
         for sf in SCALING_FACTORS:
@@ -42,36 +48,94 @@ def load_csv_data():
                         df['threads'] = t
                         all_data.append(df)
                     except Exception as e:
-                        print(f"  [!] Error reading {folder}: {e}")
+                        print(f"  [!] CSV Error {folder}: {e}")
 
     if not all_data:
         return pd.DataFrame()
     
-    # Capitalize backend names for better looking legends
-    combined_df = pd.concat(all_data, ignore_index=True)
-    combined_df['Backend'] = combined_df['backend'].replace({'posix': 'Posix', 'io_uring': 'io_uring'})
-    
-    return combined_df
+    df = pd.concat(all_data, ignore_index=True)
+    df['Backend'] = df['backend'].replace({'posix': 'Posix', 'io_uring': 'io_uring'})
+    return df
 
-def _create_academic_plot(df, y_col, y_label, title_suffix, filename_prefix):
-    """
-    Private helper function that handles the academic styling, 
-    legend placement, and saving.
-    """
-    if not os.path.exists(OUTPUT_FOLDER):
-        os.makedirs(OUTPUT_FOLDER)
+def load_perf_data():
+    """Loads perf-*.txt JSON files."""
+    all_perf = []
+    print(f"Scanning Perf logs in: {os.path.abspath(BASE_DIR)}")
 
-    # High-contrast, colorblind-friendly palette
+    for backend in BACKENDS:
+        for sf in SCALING_FACTORS:
+            for t in THREADS:
+                folder_name = f"results-{backend}-sf{sf}-t{t}"
+                perf_dir = os.path.join(BASE_DIR, folder_name, "perf")
+                
+                if not os.path.exists(perf_dir):
+                    continue
+
+                for q_id in TARGET_QUERIES:
+                    q_str = f"q{q_id:02d}" 
+                    filename = f"perf-{backend}-sf{sf}-{q_str}.txt"
+                    filepath = os.path.join(perf_dir, filename)
+
+                    if os.path.exists(filepath):
+                        try:
+                            metrics = {}
+                            with open(filepath, 'r') as f:
+                                for line in f:
+                                    if not line.strip(): continue
+                                    try:
+                                        entry = json.loads(line)
+                                        event = entry.get('event')
+                                        val = float(entry.get('counter-value', 0))
+                                        if event in metrics:
+                                            metrics[event] = max(metrics[event], val)
+                                        else:
+                                            metrics[event] = val
+                                    except ValueError:
+                                        continue
+                            
+                            row = metrics
+                            row['backend'] = backend
+                            row['sf'] = sf
+                            row['threads'] = t
+                            row['query'] = q_id
+                            all_perf.append(row)
+
+                        except Exception as e:
+                            print(f"  [!] Perf Error {filepath}: {e}")
+
+    if not all_perf:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_perf)
+    df['Backend'] = df['backend'].replace({'posix': 'Posix', 'io_uring': 'io_uring'})
+
+    # Derived Metrics
+    if 'instructions:u' in df and 'cycles' in df:
+        df['ipc'] = df['instructions:u'] / df['cycles']
+    if 'L1-dcache-load-misses' in df and 'L1-dcache-loads' in df:
+        df['l1_miss_ratio'] = (df['L1-dcache-load-misses'] / df['L1-dcache-loads']) * 100
+    if 'LLC-load-misses' in df and 'LLC-loads' in df:
+        df['llc_miss_ratio'] = (df['LLC-load-misses'] / df['LLC-loads']) * 100
+
+    return df
+
+# --- 4. PLOTTING HELPER ---
+def _create_academic_plot(df, y_col, y_label, title_suffix, filename_prefix, target_folder):
+    """
+    Generates a plot and saves it to the specific 'target_folder'.
+    """
+    # Create the specific subfolder if it doesn't exist
+    if not os.path.exists(target_folder):
+        os.makedirs(target_folder)
+
     sns.set_palette(["#4c72b0", "#dd8452"]) 
 
     for q_id in TARGET_QUERIES:
         query_df = df[df['query'] == q_id]
 
-        # Skip if no data or if all values are 0 (common for Writes)
-        if query_df.empty or query_df[y_col].sum() == 0:
+        if query_df.empty or y_col not in query_df or query_df[y_col].sum() == 0:
             continue
 
-        # Plotting
         g = sns.catplot(
             data=query_df,
             kind="bar",
@@ -89,66 +153,48 @@ def _create_academic_plot(df, y_col, y_label, title_suffix, filename_prefix):
 
         g.set_axis_labels("Number of Threads", y_label)
         g.set_titles("SF {col_name}")
-        
-        # --- NEW FIX: Force Y-axis to start at 0 ---
-        # (0, None) means start at 0, but let the top auto-scale to the data max
-        g.set(ylim=(0, None)) 
+        g.set(ylim=(0, None))
 
-        # Title & Legend
         g.fig.suptitle(f"TPC-H Query {q_id}: {title_suffix}", y=1.1, fontsize=14, weight='bold')
         
         handles, labels = g.axes[0][0].get_legend_handles_labels()
         g.fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.05), ncol=2, frameon=False)
 
-        # Formatting & Save
         g.despine(left=True)
         plt.subplots_adjust(top=0.85)
         
         filename = f"{filename_prefix}_query_{q_id}.svg"
-        save_path = os.path.join(OUTPUT_FOLDER, filename)
+        save_path = os.path.join(target_folder, filename)
         g.savefig(save_path, format='svg', bbox_inches='tight')
         print(f"Generated: {save_path}")
 
-# --- 4. PUBLIC PLOTTING FUNCTIONS ---
-
-def plot_latency(df):
-    print("\n--- Generating Latency Plots ---")
-    _create_academic_plot(
-        df, 
-        y_col='elapsed_ms', 
-        y_label='Latency (ms)', 
-        title_suffix='Latency', 
-        filename_prefix='latency'
-    )
-
-def plot_read_throughput(df):
-    print("\n--- Generating Read Throughput Plots ---")
-    _create_academic_plot(
-        df, 
-        y_col='read_mb_s', 
-        y_label='Read Throughput (MB/s)', 
-        title_suffix='Read Throughput', 
-        filename_prefix='read_throughput'
-    )
-
-def plot_write_throughput(df):
-    print("\n--- Generating Write Throughput Plots ---")
-    _create_academic_plot(
-        df, 
-        y_col='write_mb_s', 
-        y_label='Write Throughput (MB/s)', 
-        title_suffix='Write Throughput', 
-        filename_prefix='write_throughput'
-    )
-
 # --- 5. EXECUTION ---
 if __name__ == "__main__":
-    data = load_csv_data()
     
-    if not data.empty:
-        plot_latency(data)
-        plot_read_throughput(data)
-        plot_write_throughput(data)
-        print("\nAll plots saved to 'plots/' folder.")
-    else:
-        print("No data found.")
+    # 1. METRICS (Throughput/Latency) -> plots/metrics/
+    csv_df = load_csv_data()
+    if not csv_df.empty:
+        print(f"\n--- Generating Standard Metrics in '{METRICS_DIR}' ---")
+        _create_academic_plot(csv_df, 'elapsed_ms', 'Latency (ms)', 'Latency', 'latency', METRICS_DIR)
+        _create_academic_plot(csv_df, 'read_mb_s', 'Read Throughput (MB/s)', 'Read Throughput', 'read_throughput', METRICS_DIR)
+        _create_academic_plot(csv_df, 'write_mb_s', 'Write Throughput (MB/s)', 'Write Throughput', 'write_throughput', METRICS_DIR)
+
+    # 2. PERF (Hardware Counters) -> plots/perf/
+    perf_df = load_perf_data()
+    if not perf_df.empty:
+        print(f"\n--- Generating Perf Metrics in '{PERF_DIR}' ---")
+        
+        # CPU
+        _create_academic_plot(perf_df, 'ipc', 'IPC (Ins/Cycle)', 'Instructions Per Cycle', 'perf_ipc', PERF_DIR)
+        _create_academic_plot(perf_df, 'context-switches', 'Count', 'Context Switches', 'perf_context_switches', PERF_DIR)
+        
+        # Memory
+        _create_academic_plot(perf_df, 'l1_miss_ratio', 'Miss Ratio (%)', 'L1 Cache Miss Ratio', 'perf_l1_misses', PERF_DIR)
+        _create_academic_plot(perf_df, 'llc_miss_ratio', 'Miss Ratio (%)', 'LLC Cache Miss Ratio', 'perf_llc_misses', PERF_DIR)
+        
+        # Storage
+        _create_academic_plot(perf_df, 'block:block_rq_complete', 'Count', 'Block Layer Completions', 'perf_block_complete', PERF_DIR)
+        _create_academic_plot(perf_df, 'nvme:nvme_complete_rq', 'Count', 'NVMe Driver Completions', 'perf_nvme_complete', PERF_DIR)
+        _create_academic_plot(perf_df, 'nvme:nvme_sq', 'Count', 'NVMe Submission Queue Updates', 'perf_nvme_sq', PERF_DIR)
+
+    print("\nDone.")

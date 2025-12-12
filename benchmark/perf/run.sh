@@ -64,8 +64,9 @@ setup_environment() {
 
 # ================= Main =================
 
-scale_factors=(1 10 100)
-threads_list=(1 2 4 8 16)
+scale_factors=(5) #1 10 100
+threads_list=(16) #1 2 4 8 16
+memory_limit=512
 backend_targets=("posix" "io_uring")
 
 echo "Starting Experiment Suite..."
@@ -97,11 +98,12 @@ do
             echo "Running: Target=$target | SF=$sf | Threads=$t"    
 
             if command -v python3 &> /dev/null; then
-                echo "Executing: python3 main.py --sf=$sf --target=$target --threads="$t" --folder=results-${OUTPUT_FOLDER}-sf${sf} --monitor-perf"
+                echo "Executing: python3 main.py --sf=$sf --target=$target --threads="$t" --memory="$memory_limit" --folder=results-${OUTPUT_FOLDER}-sf${sf} --monitor-perf"
                 python3 -u main.py \
                     --sf="$sf" \
                     --target="$target" \
                     --threads="$t" \
+                    --memory="$memory_limit" \
                     --folder="$OUTPUT_FOLDER" \
                     --monitor-perf
             else

@@ -33,6 +33,14 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--memory",
+        type=int,
+        help="Memory limit for benchmarking",
+        required=False, # Change to False
+        default=2000     # Provide a default value
+    )
+
+    parser.add_argument(
         "--sf",
         type=int,
         default=16,

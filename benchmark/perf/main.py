@@ -10,7 +10,6 @@ TPCH_INPUT_DIR = "."
 
 # Queries to test: 6 (baseline), others (heavy)
 TARGET_QUERIES = [6, 9, 13, 18]
-MEMORY_MB = 2000
 
 DEFAULT_DEVICE = "/dev/nvme0n1"
 NG_DEVICE = "*dev/ng0n1"
@@ -66,11 +65,11 @@ def main():
     db = NvmeDatabase(
             db_path=DB_PATH,
             threads=args.threads,
-            memory=MEMORY_MB,
+            memory=args.memory,
             config=ConnectionConfig(
                 device=DEFAULT_DEVICE,
                 backend=args.target,
-                memory=MEMORY_MB,
+                memory=args.memory,
                 use_fdp=False,
                 threads=args.threads,
             )
